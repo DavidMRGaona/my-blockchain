@@ -1,6 +1,6 @@
-# my-blockchain
+# My Little Blockchain
 
-A simple tutorial for developing a blockchain application from scratch in Python.1q
+A simple blockchain application in Python.
 
 ## Instructions to run
 
