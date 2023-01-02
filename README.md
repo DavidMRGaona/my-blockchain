@@ -1,6 +1,6 @@
 # my-blockchain
 
-A simple tutorial for developing a blockchain application from scratch in Python.
+A simple tutorial for developing a blockchain application from scratch in Python.1q
 
 ## Instructions to run
 
