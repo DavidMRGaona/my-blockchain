@@ -123,6 +123,7 @@ class Blockchain:
         proof = self.proof_of_work(new_block)
         self.add_block(new_block, proof)
         self.unconfirmed_transactions = []
+        announce_new_block(new_block)
         return new_block.index
 
 
@@ -147,27 +148,146 @@ def new_transaction():
 
         blockchain.add_new_transaction(tx_data)
 
-        return "Success", 201
+    return "Success", 201
 
-    @app.route('/chain', methods=['GET'])
-    def get_chain():
-        chain_data = []
-        for block in blockchain.chain:
-            chain_data.append(block.__dict__)
 
-        return json.dumps({
-            "length": len(chain_data),
-            "chain": chain_data
-        })
+@app.route('/chain', methods=['GET'])
+def get_chain():
+    chain_data = []
+    for block in blockchain.chain:
+        chain_data.append(block.__dict__)
 
-    @app.route('/mine', methods=['GET'])
-    def mine_unconfirmed_transactions():
-        result = blockchain.mine()
-        if not result:
-            return "No transaction to mine"
+    return json.dumps({
+        "length": len(chain_data),
+        "chain": chain_data
+    })
 
-        return "Block #{} is mined".format(result)
 
-    @app.route('/pending-tx')
-    def get_pending_tx():
-        return json.dumps(blockchain.unconfirmed_transactions)
+@app.route('/mine', methods=['GET'])
+def mine_unconfirmed_transactions():
+    result = blockchain.mine()
+    if not result:
+        return "No transaction to mine"
+
+    return "Block #{} is mined".format(result)
+
+
+@app.route('/pending-tx')
+def get_pending_tx():
+    return json.dumps(blockchain.unconfirmed_transactions)
+
+
+# Contiene las direcciones de otros compañeros que participan en la red.
+peers = set()
+
+
+# Punto de acceso para adir nuevos compañeros a la red.
+@app.route('/register_node', methods=['POST'])
+def register_new_peers():
+    # La dirección del nodo compañero.
+    node_address = request.get_json()['node_address']
+    if not node_address:
+        return "Invalid data", 400
+
+    # Añadir el nodo a la lista de compañeros.
+    peers.add(node_address)
+
+    # Retornar el blockchain al nuevo nodo registrado para que pueda sincronizar.
+    return get_chain()
+
+
+@app.route('/register_with', methods=['POST'])
+def register_with_existing_node():
+    """
+    Internamente llama al punto de acceso '/register_node' para registrar el nodo actual con el nodo remoto
+    especificado en la petición, y sincronizar el blockchain a si mismo con el nodo remote
+    """
+    node_address = request.get_json()['node_address']
+    if not node_address:
+        return "Invalid data", 400
+
+    data = {'node_address': request.host_url}
+    headers = {'Content-Type': 'application/json'}
+
+    # Hacer una petición para registrarse en el nodo remoto y obtener información
+    response = requests.post(node_address + '/register_node', data=json.dumps(data), headers=headers)
+
+    if response.status_code == 200:
+        global blockchain
+        global peers
+        # Actualizar la cadena y los compañeros.
+        chain_dump = response.json()['chain']
+        blockchain = create_chain_from_dump(chain_dump)
+        peers.update(response.json()['peers'])
+        return "Registration successful", 200
+    else:
+        # Si algo sale mal, lo pasamos a la respuesta de la API
+        return response.content, response.status_code
+
+
+def create_chain_from_dump(chain_dump):
+    blockchain = Blockchain()
+    for idx, block_data in enumerate(chain_dump):
+        block = Block(block_data['index'],
+                      block_data['transactions'],
+                      block_data['timestamp'],
+                      block_data['previous_hash'])
+        proof = block_data['hash']
+        if idx > 0:
+            added = blockchain.add_block(block, proof)
+            if not added:
+                raise Exception("The chain dump is tampered!")
+        else:  # El bloque es un bloque génesis, no necesita verificación
+            blockchain.chain.append(block)
+
+    return blockchain
+
+
+def consensus():
+    """
+    Simple algoritmo de consenso. Si una cadena válida más larga es encontrada, la nuestra es reemplazada por ella.
+    """
+    global blockchain
+
+    longest_chain = None
+    current_len = len(blockchain)
+
+    for node in peers:
+        response = requests.get('http://{}/chain'.format(node))
+        length = response.json()['length']
+        chain = response.json()['chain']
+        if length > current_len and blockchain.check_chain_validity(chain):
+            current_len = length
+            longest_chain = chain
+
+        if longest_chain:
+            blockchain = longest_chain
+            return True
+
+    return False
+
+
+# Punto de acceso para añadir un bloque minado por alguien más a la cadena del nodo.
+@app.route('/add_block', methods=['POST'])
+def validate_and_add_block():
+    block_data = request.get_json()
+    block = Block(block_data['index'],
+                  block_data['transactions'],
+                  block_data['timestamp'],
+                  block_data['previous_hash'])
+    proof = block_data['hash']
+    added = blockchain.add_block(block, proof)
+
+    if not added:
+        return "The block was discarded by the node", 400
+
+    return "Block added to the chain", 201
+
+
+def announce_new_block(block):
+    for peer in peers:
+        url = "http://{}/add_block".format(peer)
+        requests.post(url, data=json.dumps(block.__dict__, sort_keys=True))
+
+
+app.run(debug=True, port=8000)
