@@ -1,33 +1,37 @@
-from typing import List, Any
-from flask import Flask, request
+import os
+import sys
+import signal
+import atexit
 from hashlib import sha256
 import json
 import time
+
+from flask import Flask, request
 import requests
 
 
 class Block:
-    def __init__(self, index, transactions, timestamp, previous_hash):
+    def __init__(self, index, transactions, timestamp, previous_hash, nonce=0):
         """"
         Constrictor de la clase 'Block'.
         :param index: ID único del bloque.
         :param transactions: Lista de transacciones.
         :param timestamp: momento en que el bloque fue generado.
+        :param previous_hash: hash del bloque anterior
         """
         self.index = index
         self.transactions = transactions
         self.timestamp = timestamp
-        # Agregamos un campo para el hash del bloque anterior
         self.previous_hash = previous_hash
+        self.nonce = nonce
 
-    @staticmethod
-    def compute_hash(block):
+    def compute_hash(self):
         """"
         Convierte el bloque en una cadena JSON y luego retorna el hash del mismo.
         La cadena equivalente también considera el campo previous_hash, pues self.__dict__ devuelve todos los campos
         de la clase.
         """
-        block_string = json.dumps(block.__dict__, sort_keys=True)
+        block_string = json.dumps(self.__dict__, sort_keys=True)
 
         return sha256(block_string.encode()).hexdigest()
 
@@ -35,15 +39,16 @@ class Block:
 class Blockchain:
     # Dificultad del algoritmo de prueba de trabajo
     difficulty = 2
-    unconfirmed_transactions: List[Any]
 
-    def __init(self):
+    def __init__(self, chain=None):
         """"
-        Constrictor para la clase 'Blockchain'
+        Constructor para la clase 'Blockchain'
         """
         self.unconfirmed_transactions = []
-        self.chain = []
-        self.create_genesis_block()
+        self.chain = chain
+        if self.chain is None:
+            self.chain = []
+            self.create_genesis_block()
 
     def create_genesis_block(self):
         """"
@@ -70,7 +75,7 @@ class Blockchain:
         block.nonce = 0
 
         computed_hash = block.compute_hash()
-        while not computed_hash.startsWith('0' * Blockchain.difficulty):
+        while not computed_hash.startswith('0' * Blockchain.difficulty):
             block.nonce += 1
             computed_hash = block.compute_hash()
 
@@ -93,7 +98,6 @@ class Blockchain:
 
         block.hash = proof
         self.chain.append(block)
-        return True
 
     @staticmethod
     def is_valid_proof(block, block_hash):
@@ -105,6 +109,24 @@ class Blockchain:
     def add_new_transaction(self, transaction):
         self.unconfirmed_transactions.append(transaction)
 
+    @classmethod
+    def check_chain_validity(cls, chain):
+        result = True
+        previous_hash = "0"
+
+        for block in chain:
+            block_hash = block.hash
+            # Elimina el campo hash para recalcular de nuevo el hash usando el método 'compute_hash'
+            delattr(block, "hash")
+
+            if not cls.is_valid_proof(block, block_hash) or previous_hash != block.previous_hash:
+                result = False
+                break
+
+            block.hash, previous_hash = block_hash, block_hash
+
+        return result
+
     def mine(self):
         """
         Esta functión sirve como una interfaz para añadir las transacciones pendientes a la blockchain añadiéndolas al
@@ -115,7 +137,7 @@ class Blockchain:
 
         last_block = self.last_block
 
-        new_block = Block(index=last_block + 1,
+        new_block = Block(index=last_block.index + 1,
                           transactions=self.unconfirmed_transactions,
                           timestamp=time.time(),
                           previous_hash=last_block.hash)
@@ -123,7 +145,6 @@ class Blockchain:
         proof = self.proof_of_work(new_block)
         self.add_block(new_block, proof)
         self.unconfirmed_transactions = []
-        announce_new_block(new_block)
         return new_block.index
 
 
@@ -131,24 +152,48 @@ class Blockchain:
 app = Flask(__name__)
 
 # Inicializamos el objeto Blockchain.
-blockchain = Blockchain()
+blockchain = None
+
+# Contiene las direcciones de otros compañeros que participan en la red.
+peers = set()
 
 
 # Método de Flask para declarar los puntos de acceso.
 @app.route('/new_transaction', methods=['POST'])
 def new_transaction():
     tx_data = request.get_json()
-    required_fields = ['author', 'content']
+    required_fields = ["author", "content"]
 
     for field in required_fields:
         if not tx_data.get(field):
             return "Invalid transaction data", 404
 
-        tx_data['timestamp'] = time.time()
+    tx_data["timestamp"] = time.time()
 
-        blockchain.add_new_transaction(tx_data)
+    blockchain.add_new_transaction(tx_data)
 
     return "Success", 201
+
+
+chain_file_name = os.environ.get('DATA_FILE')
+
+
+def create_chain_from_dump(chain_dump):
+    generated_blockchain = Blockchain()
+    for idx, block_data in enumerate(chain_dump):
+        block = Block(block_data['index'],
+                      block_data['transactions'],
+                      block_data['timestamp'],
+                      block_data['previous_hash'])
+        proof = block_data['hash']
+        if idx > 0:
+            added = generated_blockchain.add_block(block, proof)
+            if not added:
+                raise Exception("The chain dump is tampered!")
+        else:  # El bloque es un bloque génesis, no necesita verificación
+            generated_blockchain.chain.append(block)
+
+    return generated_blockchain
 
 
 @app.route('/chain', methods=['GET'])
@@ -163,22 +208,52 @@ def get_chain():
     })
 
 
+def save_chain():
+    if chain_file_name is not None:
+        with open(chain_file_name, 'w') as chain_file:
+            chain_file.write(get_chain())
+
+
+def exit_from_signal(signum, stack_frame):
+    sys.exit(0)
+
+
+atexit.register(save_chain)
+signal.signal(signal.SIGTERM, exit_from_signal)
+signal.signal(signal.SIGINT, exit_from_signal)
+
+
+if chain_file_name is None:
+    data = None
+else:
+    with open(chain_file_name, 'r') as chain_file:
+        raw_data = chain_file.read()
+        if raw_data is None or len(raw_data) == 0:
+            data = None
+        else:
+            data = json.loads(raw_data)
+
+if data is None:
+    # the node's copy of blockchain
+    blockchain = Blockchain()
+else:
+    blockchain = create_chain_from_dump(data['chain'])
+    peers.update(data['peers'])
+
+
 @app.route('/mine', methods=['GET'])
 def mine_unconfirmed_transactions():
     result = blockchain.mine()
     if not result:
-        return "No transaction to mine"
-
-    return "Block #{} is mined".format(result)
-
-
-@app.route('/pending-tx')
-def get_pending_tx():
-    return json.dumps(blockchain.unconfirmed_transactions)
-
-
-# Contiene las direcciones de otros compañeros que participan en la red.
-peers = set()
+        return "No transactions to mine"
+    else:
+        # Making sure we have the longest chain before announcing to the network
+        chain_length = len(blockchain.chain)
+        consensus()
+        if chain_length == len(blockchain.chain):
+            # announce the recently mined block to the network
+            announce_new_block(blockchain.last_block)
+        return "Block #{} is mined.".format(blockchain.last_block.index)
 
 
 # Punto de acceso para adir nuevos compañeros a la red.
@@ -225,22 +300,28 @@ def register_with_existing_node():
         return response.content, response.status_code
 
 
-def create_chain_from_dump(chain_dump):
-    blockchain = Blockchain()
-    for idx, block_data in enumerate(chain_dump):
-        block = Block(block_data['index'],
-                      block_data['transactions'],
-                      block_data['timestamp'],
-                      block_data['previous_hash'])
-        proof = block_data['hash']
-        if idx > 0:
-            added = blockchain.add_block(block, proof)
-            if not added:
-                raise Exception("The chain dump is tampered!")
-        else:  # El bloque es un bloque génesis, no necesita verificación
-            blockchain.chain.append(block)
+# Punto de acceso para añadir un bloque minado por alguien más a la cadena del nodo.
+@app.route('/add_block', methods=['POST'])
+def verify_and_add_block():
+    block_data = request.get_json()
+    block = Block(block_data["index"],
+                  block_data["transactions"],
+                  block_data["timestamp"],
+                  block_data["previous_hash"],
+                  block_data["nonce"])
 
-    return blockchain
+    proof = block_data['hash']
+    try:
+        blockchain.add_block(block, proof)
+    except ValueError as e:
+        return "The block was discarded by the node: " + e.str(), 400
+
+    return "Block added to the chain", 201
+
+
+@app.route('/pending-tx')
+def get_pending_tx():
+    return json.dumps(blockchain.unconfirmed_transactions)
 
 
 def consensus():
@@ -250,38 +331,21 @@ def consensus():
     global blockchain
 
     longest_chain = None
-    current_len = len(blockchain)
+    current_len = len(blockchain.chain)
 
     for node in peers:
-        response = requests.get('http://{}/chain'.format(node))
+        response = requests.get('{}chain'.format(node))
         length = response.json()['length']
         chain = response.json()['chain']
         if length > current_len and blockchain.check_chain_validity(chain):
             current_len = length
             longest_chain = chain
 
-        if longest_chain:
-            blockchain = longest_chain
-            return True
+    if longest_chain:
+        blockchain = longest_chain
+        return True
 
     return False
-
-
-# Punto de acceso para añadir un bloque minado por alguien más a la cadena del nodo.
-@app.route('/add_block', methods=['POST'])
-def validate_and_add_block():
-    block_data = request.get_json()
-    block = Block(block_data['index'],
-                  block_data['transactions'],
-                  block_data['timestamp'],
-                  block_data['previous_hash'])
-    proof = block_data['hash']
-    added = blockchain.add_block(block, proof)
-
-    if not added:
-        return "The block was discarded by the node", 400
-
-    return "Block added to the chain", 201
 
 
 def announce_new_block(block):
